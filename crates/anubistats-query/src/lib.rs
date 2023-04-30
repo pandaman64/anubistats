@@ -1,3 +1,6 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ParseError;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Query {
     Word(String),
@@ -5,52 +8,57 @@ pub enum Query {
     Or(Box<Query>, Box<Query>),
 }
 
-fn primary_expr(input: &str) -> (&str, Query) {
+fn primary_expr(input: &str) -> Result<(&str, Query), ParseError> {
     let input = input.trim_start();
     if let Some(input) = input.strip_prefix('(') {
-        let (input, query) = expr(input);
+        let (input, query) = expr(input)?;
         let input = input.trim_start();
-        assert!(input.starts_with(')'));
-        (&input[1..], query)
+        if !input.starts_with(')') {
+            return Err(ParseError);
+        }
+        Ok((&input[1..], query))
     } else {
         let (word, input) = match input.find(|c: char| !c.is_alphanumeric()) {
             Some(idx) => input.split_at(idx),
             None => (input, ""),
         };
-        (input, Query::Word(word.to_string()))
+        Ok((input, Query::Word(word.to_string())))
     }
 }
 
-fn or_expr(input: &str) -> (&str, Query) {
-    let (input, lhs) = primary_expr(input);
+fn or_expr(input: &str) -> Result<(&str, Query), ParseError> {
+    let (input, lhs) = primary_expr(input)?;
     let input = input.trim_start();
     if let Some(input) = input.strip_prefix("OR") {
-        let (input, rhs) = or_expr(input);
-        (input, Query::Or(Box::new(lhs), Box::new(rhs)))
+        let (input, rhs) = or_expr(input)?;
+        Ok((input, Query::Or(Box::new(lhs), Box::new(rhs))))
     } else {
-        (input, lhs)
+        Ok((input, lhs))
     }
 }
 
-fn and_expr(input: &str) -> (&str, Query) {
-    let (input, lhs) = or_expr(input);
+fn and_expr(input: &str) -> Result<(&str, Query), ParseError> {
+    let (input, lhs) = or_expr(input)?;
     let input = input.trim_start();
     if let Some(input) = input.strip_prefix("AND") {
-        let (input, rhs) = and_expr(input);
-        (input, Query::And(Box::new(lhs), Box::new(rhs)))
+        let (input, rhs) = and_expr(input)?;
+        Ok((input, Query::And(Box::new(lhs), Box::new(rhs))))
     } else {
-        (input, lhs)
+        Ok((input, lhs))
     }
 }
 
-fn expr(input: &str) -> (&str, Query) {
+fn expr(input: &str) -> Result<(&str, Query), ParseError> {
     and_expr(input)
 }
 
-pub fn parse(input: &str) -> Query {
-    let (input, query) = expr(input);
-    assert!(input.trim().is_empty());
-    query
+pub fn parse(input: &str) -> Result<Query, ParseError> {
+    let (input, query) = expr(input)?;
+    if input.trim_end().is_empty() {
+        Ok(query)
+    } else {
+        Err(ParseError)
+    }
 }
 
 #[cfg(test)]
@@ -60,7 +68,7 @@ mod test {
     #[test]
     fn test_or() {
         assert_eq!(
-            parse("foo OR bar"),
+            parse("foo OR bar").unwrap(),
             Query::Or(
                 Box::new(Query::Word("foo".to_string())),
                 Box::new(Query::Word("bar".to_string()))
@@ -68,7 +76,7 @@ mod test {
         );
 
         assert_eq!(
-            parse("foo OR bar OR baz"),
+            parse("foo OR bar OR baz").unwrap(),
             Query::Or(
                 Box::new(Query::Word("foo".to_string())),
                 Box::new(Query::Or(
@@ -82,7 +90,7 @@ mod test {
     #[test]
     fn test_and() {
         assert_eq!(
-            parse("foo AND bar"),
+            parse("foo AND bar").unwrap(),
             Query::And(
                 Box::new(Query::Word("foo".to_string())),
                 Box::new(Query::Word("bar".to_string()))
@@ -90,7 +98,7 @@ mod test {
         );
 
         assert_eq!(
-            parse("foo AND bar AND baz"),
+            parse("foo AND bar AND baz").unwrap(),
             Query::And(
                 Box::new(Query::Word("foo".to_string())),
                 Box::new(Query::And(
@@ -103,10 +111,10 @@ mod test {
 
     #[test]
     fn test_paren() {
-        assert_eq!(parse("(foo)"), Query::Word("foo".to_string()));
+        assert_eq!(parse("(foo)").unwrap(), Query::Word("foo".to_string()));
 
         assert_eq!(
-            parse("(foo AND bar)"),
+            parse("(foo AND bar)").unwrap(),
             Query::And(
                 Box::new(Query::Word("foo".to_string())),
                 Box::new(Query::Word("bar".to_string()))
@@ -114,7 +122,7 @@ mod test {
         );
 
         assert_eq!(
-            parse("(foo AND bar) OR baz"),
+            parse("(foo AND bar) OR baz").unwrap(),
             Query::Or(
                 Box::new(Query::And(
                     Box::new(Query::Word("foo".to_string())),
@@ -125,7 +133,7 @@ mod test {
         );
 
         assert_eq!(
-            parse("foo AND (bar OR baz)"),
+            parse("foo AND (bar OR baz)").unwrap(),
             Query::And(
                 Box::new(Query::Word("foo".to_string())),
                 Box::new(Query::Or(
@@ -139,7 +147,7 @@ mod test {
     #[test]
     fn test_precedence() {
         assert_eq!(
-            parse("foo AND bar OR baz"),
+            parse("foo AND bar OR baz").unwrap(),
             Query::And(
                 Box::new(Query::Word("foo".to_string())),
                 Box::new(Query::Or(
@@ -150,7 +158,7 @@ mod test {
         );
 
         assert_eq!(
-            parse("foo OR bar AND baz"),
+            parse("foo OR bar AND baz").unwrap(),
             Query::And(
                 Box::new(Query::Or(
                     Box::new(Query::Word("foo".to_string())),
