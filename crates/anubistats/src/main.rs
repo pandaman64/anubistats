@@ -12,6 +12,7 @@ fn main() -> anyhow::Result<()> {
     let mut postings_lists = BTreeMap::new();
     let mut roaring_id = 0;
     for record in read_datasets()? {
+        roaring_id += 1;
         let record = record?;
         for word in record.title.split_whitespace() {
             let word = word.to_lowercase();
@@ -19,8 +20,7 @@ fn main() -> anyhow::Result<()> {
                 let postings_list = postings_lists
                     .entry(word)
                     .or_insert_with(RoaringBitmap::new);
-                assert!(postings_list.push(roaring_id));
-                roaring_id += 1;
+                postings_list.push(roaring_id);
             }
         }
     }
