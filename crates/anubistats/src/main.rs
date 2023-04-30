@@ -1,73 +1,43 @@
-use std::{
-    collections::{BinaryHeap, HashMap, HashSet},
-    fs,
-};
+//! In this example, we create postings lists for each word in the dataset.
+
+use std::collections::HashMap;
 
 use anubistats::read_datasets;
 
-fn count_words<I: Iterator<Item = anyhow::Result<String>>>(
-    text: I,
-    stopwords: &HashSet<&str>,
-) -> anyhow::Result<HashMap<String, i64>> {
-    let mut words = HashMap::new();
-
-    for fragment in text {
-        let fragment = fragment?;
-        for word in fragment.split_whitespace() {
-            if stopwords.contains(word) {
-                continue;
-            }
-            let word = word
-                .trim_matches(|c: char| !c.is_alphanumeric())
-                .to_lowercase();
-            if !word.is_empty() && !stopwords.contains(word.as_str()) {
-                *words.entry(word).or_insert(0i64) += 1;
-            }
-        }
-    }
-
-    Ok(words)
-}
-
-fn count_frequent_words(words: HashMap<String, i64>, limit: usize) -> Vec<(i64, String)> {
-    let mut frequent_words = BinaryHeap::new();
-    for (word, count) in words {
-        frequent_words.push((-count, word));
-        if frequent_words.len() > limit {
-            frequent_words.pop();
-        }
-    }
-    let mut frequent_words = frequent_words.into_vec();
-    frequent_words.sort_unstable();
-    frequent_words
-}
-
 fn main() -> anyhow::Result<()> {
-    let stopwords = fs::read_to_string("stopwords-en.txt")?;
-    let stopwords: HashSet<_> = stopwords.lines().map(|line| line.trim()).collect();
-
-    let records = read_datasets()?;
-    let title_words = count_words(
-        records.map(|result| result.map(|record| record.title)),
-        &stopwords,
-    )?;
-    println!("{} unique words in titles", title_words.len());
-    let frequent_title_words = count_frequent_words(title_words, 10);
-    println!("Most frequent words in titles:");
-    for (count, word) in frequent_title_words {
-        println!("{}: {}", word, -count);
+    // Construct postings lists from the words in the titles.
+    let mut postings_lists = HashMap::new();
+    for record in read_datasets()? {
+        let record = record?;
+        for word in record.title.split_whitespace() {
+            let word = word.to_lowercase();
+            if !word.is_empty() {
+                let postings_list = postings_lists.entry(word).or_insert_with(Vec::new);
+                postings_list.push(record.id);
+            }
+        }
     }
 
-    let records = read_datasets()?;
-    let text_words = count_words(
-        records.map(|result| result.map(|record| record.text)),
-        &stopwords,
-    )?;
-    println!("{} unique words in text", text_words.len());
-    let frequent_text_words = count_frequent_words(text_words, 10);
-    println!("Most frequent words in text:");
-    for (count, word) in frequent_text_words {
-        println!("{}: {}", word, -count);
+    // REPL for querying the postings lists.
+    let mut input = String::new();
+    loop {
+        println!("Enter a word to query:");
+        input.clear();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+        if input.is_empty() {
+            break;
+        }
+        let postings_list = postings_lists.get(input);
+        if let Some(postings_list) = postings_list {
+            println!("{} documents contain the word '{}'", postings_list.len(), input);
+            // println!("The documents are:");
+            // for id in postings_list {
+            //     println!("  {}", id);
+            // }
+        } else {
+            println!("No documents contain the word '{}'", input);
+        }
     }
 
     Ok(())
