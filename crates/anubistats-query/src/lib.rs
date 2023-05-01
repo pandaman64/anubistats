@@ -18,7 +18,7 @@ fn primary_expr(input: &str) -> Result<(&str, Query), ParseError> {
         }
         Ok((&input[1..], query))
     } else {
-        let (word, input) = match input.find(|c: char| !c.is_alphanumeric()) {
+        let (word, input) = match input.find(|c: char| c.is_whitespace() || c == '(' || c == ')') {
             Some(idx) => input.split_at(idx),
             None => (input, ""),
         };
