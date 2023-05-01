@@ -1,5 +1,5 @@
 //! This binary creates the following data files to facillitate the queries:
-//! 
+//!
 //! 1. The inverted index for words in the Hacker News titles.
 //!    The file maps words to the offset of the postings list for that word in the postings lists file.
 //! 2. The postings list for each word in the Hacker News titles.
@@ -55,11 +55,12 @@ fn main() -> anyhow::Result<()> {
     for (word, postings_list) in postings_lists {
         postings_list.serialize_into(&mut postings_lists_writer)?;
         postings_lists_offsets.insert(word.clone(), offset);
-        offset += postings_list.serialized_size();
 
         word_builder.append_value(word);
         offset_builder.append_value(offset.try_into()?);
         length_builder.append_value(postings_list.serialized_size().try_into()?);
+
+        offset += postings_list.serialized_size();
     }
 
     let postings_lists_offsets_file = File::create("postings_lists_offsets.json")?;
