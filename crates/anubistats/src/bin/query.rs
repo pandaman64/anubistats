@@ -10,7 +10,9 @@ use std::{
 use anubistats_query::Query;
 use arrow::array::{AsArray, BooleanArray, StringArray, UInt32Array, UInt64Array};
 use parquet::arrow::{
-    arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter},
+    arrow_reader::{
+        ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
+    },
     ProjectionMask,
 };
 use roaring::RoaringBitmap;
@@ -47,23 +49,73 @@ fn find_postings_list(
     }
 }
 
-fn eval_query(
-    query: &Query,
-    postings_lists_file: &File,
-    offsets: &BTreeMap<String, usize>,
+#[allow(dead_code)]
+fn find_postings_list_parquet(
+    word: &str,
+    mut postings_lists_file: &File,
 ) -> anyhow::Result<RoaringBitmap> {
-    match query {
-        anubistats_query::Query::Word(word) => {
-            Ok(find_postings_list(word, postings_lists_file, offsets)?)
+    let word = word.to_string();
+    let file = File::open("postings_lists_offsets.parquet")?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+        file,
+        ArrowReaderOptions::new().with_page_index(true),
+    )?;
+
+    let predicate = ArrowPredicateFn::new(
+        ProjectionMask::leaves(
+            builder.parquet_schema(),
+            std::iter::once(
+                builder
+                    .parquet_schema()
+                    .columns()
+                    .iter()
+                    .position(|c| c.name() == "word")
+                    .unwrap(),
+            ),
+        ),
+        move |batch| {
+            let words: &StringArray = batch.column(0).as_string();
+            arrow::compute::eq_utf8_scalar(words, word.as_str())
+        },
+    );
+    let row_filter = RowFilter::new(vec![Box::new(predicate)]);
+    let mut reader = builder.with_row_filter(row_filter).build()?;
+
+    if let Some(batch) = reader.next() {
+        let batch = batch?;
+        if batch.num_rows() > 0 {
+            let offsets: &UInt64Array = batch["offset"].as_primitive();
+            let lengths: &UInt64Array = batch["length"].as_primitive();
+
+            let offset = offsets.value(0);
+            let length = lengths.value(0);
+
+            postings_lists_file.seek(SeekFrom::Start(offset))?;
+            let postings_list = RoaringBitmap::deserialize_from(postings_lists_file.take(length))?;
+
+            Ok(postings_list)
+        } else {
+            Ok(RoaringBitmap::new())
         }
+    } else {
+        Ok(RoaringBitmap::new())
+    }
+}
+
+fn eval_query<F>(query: &Query, find_postings_list: &F) -> anyhow::Result<RoaringBitmap>
+where
+    F: Fn(&str) -> anyhow::Result<RoaringBitmap>,
+{
+    match query {
+        anubistats_query::Query::Word(word) => Ok(find_postings_list(word)?),
         anubistats_query::Query::And(lhs, rhs) => {
-            let lhs = eval_query(lhs, postings_lists_file, offsets)?;
-            let rhs = eval_query(rhs, postings_lists_file, offsets)?;
+            let lhs = eval_query(lhs, find_postings_list)?;
+            let rhs = eval_query(rhs, find_postings_list)?;
             Ok(lhs & rhs)
         }
         anubistats_query::Query::Or(lhs, rhs) => {
-            let lhs = eval_query(lhs, postings_lists_file, offsets)?;
-            let rhs = eval_query(rhs, postings_lists_file, offsets)?;
+            let lhs = eval_query(lhs, find_postings_list)?;
+            let rhs = eval_query(rhs, find_postings_list)?;
             Ok(lhs | rhs)
         }
     }
@@ -126,11 +178,30 @@ fn retrieve_stored_fields(roaring_ids_filter: RoaringBitmap) -> anyhow::Result<V
     Ok(documents)
 }
 
+fn measure_time<F, R>(f: F) -> (f64, R)
+where
+    F: FnOnce() -> R,
+{
+    let start = std::time::Instant::now();
+    let result = f();
+    let end = std::time::Instant::now();
+    let duration = end - start;
+    let duration = duration.as_secs_f64();
+    (duration, result)
+}
+
 fn main() -> anyhow::Result<()> {
     // Read postings lists and index from disk.
     let postings_lists_file = File::open("postings_lists.bin")?;
-    let offsets: BTreeMap<String, usize> =
-        serde_json::from_reader(File::open("postings_lists_offsets.json")?)?;
+    let (offsets_load_time, offsets) = measure_time(|| -> anyhow::Result<_> {
+        serde_json::from_reader(File::open("postings_lists_offsets.json")?).map_err(Into::into)
+    });
+    let offsets = offsets?;
+
+    eprintln!(
+        "Loaded postings lists offsets in {:.8} ms",
+        offsets_load_time * 1000.0
+    );
 
     // REPL for querying the postings lists.
     println!("Enter a query:");
@@ -146,7 +217,15 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
-        let postings_lists = eval_query(&query, &postings_lists_file, &offsets)?;
+        let (eval_query_time, postings_lists) = measure_time(|| {
+            eval_query(&query, &|word| {
+                find_postings_list(word, &postings_lists_file, &offsets)
+            })
+        });
+        let postings_lists = postings_lists?;
+
+        eprintln!("Evaluated query in {:.8} ms", eval_query_time * 1000.0);
+
         println!(
             "{} documents match the query '{:?}'",
             postings_lists.len(),
