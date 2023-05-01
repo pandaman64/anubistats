@@ -1,3 +1,5 @@
+//! This binary provides a REPL for querying the index created by crates/anubistats/src/bin/index.rs.
+
 use std::{
     collections::BTreeMap,
     fs::File,

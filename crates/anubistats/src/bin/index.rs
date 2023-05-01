@@ -1,6 +1,9 @@
-//! In this example, we create postings lists for each word in the dataset.
-
-mod repl;
+//! This binary creates the following data files to facillitate the queries:
+//! 
+//! 1. The inverted index for words in the Hacker News titles.
+//!    The file maps words to the offset of the postings list for that word in the postings lists file.
+//! 2. The postings list for each word in the Hacker News titles.
+//! 3. The columnar store for the Hacker News entries to show the info of each entry.
 
 use std::{collections::BTreeMap, fs::File, io::BufWriter, sync::Arc};
 
