@@ -63,9 +63,6 @@ fn main() -> anyhow::Result<()> {
         offset += postings_list.serialized_size();
     }
 
-    let postings_lists_offsets_file = File::create("postings_lists_offsets.json")?;
-    serde_json::to_writer(postings_lists_offsets_file, &postings_lists_offsets)?;
-
     let schema = Schema::new(vec![
         Field::new("id", DataType::UInt32, false),
         Field::new("doc_id", DataType::UInt64, false),

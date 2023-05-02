@@ -10,7 +10,6 @@ anyhow = "1.0.70"
 csv = "1.2.1"
 roaring = "0.10.1"
 serde = { version = "1.0.160", features = ["derive"] }
-serde_json = "1.0.96"
 anubistats-query = { path = "../anubistats-query" }
 arrow = "38.0.0"
 parquet = "38.0.0"

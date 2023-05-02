@@ -1,55 +1,24 @@
 //! This binary provides a REPL for querying the index created by crates/anubistats/src/bin/index.rs.
 
 use std::{
-    collections::BTreeMap,
     fs::File,
     io::{BufRead, Read, Seek, SeekFrom},
-    ops::Bound,
 };
 
 use anubistats_query::Query;
 use arrow::array::{AsArray, BooleanArray, StringArray, UInt32Array, UInt64Array};
-use parquet::arrow::{
-    arrow_reader::{
-        ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
+use parquet::{
+    arrow::{
+        arrow_reader::{
+            ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
+            RowSelection, RowSelector,
+        },
+        ProjectionMask,
     },
-    ProjectionMask,
+    file::page_index::index::Index,
 };
 use roaring::RoaringBitmap;
 
-fn find_offset_and_length(
-    offsets: &BTreeMap<String, usize>,
-    query: &str,
-) -> Option<(usize, usize)> {
-    let mut range = offsets.range::<str, _>((Bound::Included(query), Bound::Unbounded));
-    let (first_word, offset) = range.next()?;
-    let (_, next_offset) = range.next()?;
-
-    if first_word == query {
-        let length = next_offset - offset;
-        Some((*offset, length))
-    } else {
-        None
-    }
-}
-
-fn find_postings_list(
-    word: &str,
-    mut postings_lists_file: &File,
-    offsets: &BTreeMap<String, usize>,
-) -> anyhow::Result<RoaringBitmap> {
-    if let Some((offset, length)) = find_offset_and_length(offsets, word) {
-        postings_lists_file.seek(SeekFrom::Start(offset.try_into()?))?;
-        let postings_list =
-            RoaringBitmap::deserialize_from(postings_lists_file.take(length.try_into()?))?;
-
-        Ok(postings_list)
-    } else {
-        Ok(RoaringBitmap::new())
-    }
-}
-
-#[allow(dead_code)]
 fn find_postings_list_parquet(
     word: &str,
     mut postings_lists_file: &File,
@@ -60,6 +29,58 @@ fn find_postings_list_parquet(
         file,
         ArrowReaderOptions::new().with_page_index(true),
     )?;
+
+    let offset_indexes = builder.metadata().offset_indexes().unwrap();
+    let page_indexes = builder.metadata().page_indexes().unwrap();
+
+    let mut selectors = vec![];
+
+    // ASSUMPTION:
+    // 1. The index is byte array index
+    // 2. The index is sorted in ascending order
+    for row_group in 0..offset_indexes.len() {
+        let offset_index = &offset_indexes[row_group][0];
+        let page_index = &page_indexes[row_group][0];
+        let row_group_end = builder.metadata().row_group(row_group).num_rows();
+
+        match page_index {
+            Index::BYTE_ARRAY(index) => {
+                match index.indexes.binary_search_by(|page_index| {
+                    let min = page_index.min.as_ref().unwrap().data();
+                    let max = page_index.max.as_ref().unwrap().data();
+                    let needle = word.as_bytes();
+
+                    if min > needle {
+                        std::cmp::Ordering::Greater
+                    } else if max < needle {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                }) {
+                    Ok(idx) => {
+                        let found_page_location = &offset_index[idx];
+                        let select_start = found_page_location.first_row_index;
+                        let select_end = if idx + 1 < offset_index.len() {
+                            offset_index[idx + 1].first_row_index
+                        } else {
+                            row_group_end
+                        };
+
+                        selectors.extend([
+                            RowSelector::skip(select_start.try_into().unwrap()),
+                            RowSelector::select((select_end - select_start).try_into().unwrap()),
+                            RowSelector::skip((row_group_end - select_end).try_into().unwrap()),
+                        ]);
+                    }
+                    Err(_) => {
+                        selectors.push(RowSelector::skip(row_group_end.try_into().unwrap()));
+                    }
+                };
+            }
+            _ => unreachable!(),
+        }
+    }
 
     let predicate = ArrowPredicateFn::new(
         ProjectionMask::leaves(
@@ -79,7 +100,10 @@ fn find_postings_list_parquet(
         },
     );
     let row_filter = RowFilter::new(vec![Box::new(predicate)]);
-    let mut reader = builder.with_row_filter(row_filter).build()?;
+    let mut reader = builder
+        .with_row_selection(RowSelection::from(selectors))
+        .with_row_filter(row_filter)
+        .build()?;
 
     if let Some(batch) = reader.next() {
         let batch = batch?;
@@ -193,15 +217,6 @@ where
 fn main() -> anyhow::Result<()> {
     // Read postings lists and index from disk.
     let postings_lists_file = File::open("postings_lists.bin")?;
-    let (offsets_load_time, offsets) = measure_time(|| -> anyhow::Result<_> {
-        serde_json::from_reader(File::open("postings_lists_offsets.json")?).map_err(Into::into)
-    });
-    let offsets = offsets?;
-
-    eprintln!(
-        "Loaded postings lists offsets in {:.8} ms",
-        offsets_load_time * 1000.0
-    );
 
     // REPL for querying the postings lists.
     println!("Enter a query:");
@@ -219,7 +234,7 @@ fn main() -> anyhow::Result<()> {
 
         let (eval_query_time, postings_lists) = measure_time(|| {
             eval_query(&query, &|word| {
-                find_postings_list(word, &postings_lists_file, &offsets)
+                find_postings_list_parquet(word, &postings_lists_file)
             })
         });
         let postings_lists = postings_lists?;
