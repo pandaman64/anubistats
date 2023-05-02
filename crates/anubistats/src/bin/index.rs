@@ -5,11 +5,11 @@
 //! 2. The postings list for each word in the Hacker News titles.
 //! 3. The columnar store for the Hacker News entries to show the info of each entry.
 
-use std::{collections::BTreeMap, fs::File, io::BufWriter, sync::Arc};
+use std::{collections::BTreeMap, fs::File, sync::Arc};
 
 use anubistats::read_datasets;
 use arrow::{
-    array::{StringBuilder, UInt32Builder, UInt64Builder},
+    array::{BinaryBuilder, StringBuilder, UInt32Builder, UInt64Builder},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -43,26 +43,6 @@ fn main() -> anyhow::Result<()> {
         title_builder.append_value(record.title);
     }
 
-    let postings_lists_file = File::create("postings_lists.bin")?;
-    let mut postings_lists_writer = BufWriter::new(postings_lists_file);
-    let mut postings_lists_offsets = BTreeMap::new();
-
-    let mut word_builder = StringBuilder::new();
-    let mut offset_builder = UInt64Builder::new();
-    let mut length_builder = UInt64Builder::new();
-
-    let mut offset = 0;
-    for (word, postings_list) in postings_lists {
-        postings_list.serialize_into(&mut postings_lists_writer)?;
-        postings_lists_offsets.insert(word.clone(), offset);
-
-        word_builder.append_value(word);
-        offset_builder.append_value(offset.try_into()?);
-        length_builder.append_value(postings_list.serialized_size().try_into()?);
-
-        offset += postings_list.serialized_size();
-    }
-
     let schema = Schema::new(vec![
         Field::new("id", DataType::UInt32, false),
         Field::new("doc_id", DataType::UInt64, false),
@@ -77,31 +57,36 @@ fn main() -> anyhow::Result<()> {
         ],
     )?;
 
-    let ids_file = File::create("stored_fields.parquet")?;
-    let mut writer = ArrowWriter::try_new(ids_file, batch.schema(), None)?;
+    let mut word_builder = StringBuilder::new();
+    let mut postings_list_builder = BinaryBuilder::new();
+
+    for (word, postings_list) in postings_lists {
+        let mut buffer = Vec::with_capacity(postings_list.serialized_size());
+        postings_list.serialize_into(&mut buffer)?;
+
+        word_builder.append_value(word);
+        postings_list_builder.append_value(buffer);
+    }
+
+    let stored_fields_file = File::create("stored_fields.parquet")?;
+    let mut writer = ArrowWriter::try_new(stored_fields_file, batch.schema(), None)?;
     writer.write(&batch)?;
     writer.close()?;
 
     let word_offset_schema = Schema::new(vec![
         Field::new("word", DataType::Utf8, false),
-        Field::new("offset", DataType::UInt64, false),
-        Field::new("length", DataType::UInt64, false),
+        Field::new("postings_list", DataType::Binary, false),
     ]);
     let word_batch = RecordBatch::try_new(
         Arc::new(word_offset_schema),
         vec![
             Arc::new(word_builder.finish()),
-            Arc::new(offset_builder.finish()),
-            Arc::new(length_builder.finish()),
+            Arc::new(postings_list_builder.finish()),
         ],
     )?;
 
-    let postings_list_offsets_parquet_file = File::create("postings_lists_offsets.parquet")?;
-    let mut writer = ArrowWriter::try_new(
-        postings_list_offsets_parquet_file,
-        word_batch.schema(),
-        None,
-    )?;
+    let postings_lists_file = File::create("postings_lists.parquet")?;
+    let mut writer = ArrowWriter::try_new(postings_lists_file, word_batch.schema(), None)?;
     writer.write(&word_batch)?;
     writer.close()?;
 

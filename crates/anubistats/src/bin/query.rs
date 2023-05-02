@@ -1,12 +1,9 @@
 //! This binary provides a REPL for querying the index created by crates/anubistats/src/bin/index.rs.
 
-use std::{
-    fs::File,
-    io::{BufRead, Read, Seek, SeekFrom},
-};
+use std::{fs::File, io::BufRead};
 
 use anubistats_query::Query;
-use arrow::array::{AsArray, BooleanArray, StringArray, UInt32Array, UInt64Array};
+use arrow::array::{AsArray, BinaryArray, BooleanArray, StringArray, UInt32Array, UInt64Array};
 use parquet::{
     arrow::{
         arrow_reader::{
@@ -19,19 +16,23 @@ use parquet::{
 };
 use roaring::RoaringBitmap;
 
-fn find_postings_list_parquet(
-    word: &str,
-    mut postings_lists_file: &File,
-) -> anyhow::Result<RoaringBitmap> {
+fn find_postings_list_parquet(word: &str) -> anyhow::Result<RoaringBitmap> {
     let word = word.to_string();
-    let file = File::open("postings_lists_offsets.parquet")?;
+    let file = File::open("postings_lists.parquet")?;
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
         file,
         ArrowReaderOptions::new().with_page_index(true),
     )?;
 
-    let offset_indexes = builder.metadata().offset_indexes().unwrap();
-    let page_indexes = builder.metadata().page_indexes().unwrap();
+    let metadata = builder.metadata();
+    let offset_indexes = metadata.offset_indexes().unwrap();
+    let page_indexes = metadata.page_indexes().unwrap();
+    let word_column_index = builder
+        .parquet_schema()
+        .columns()
+        .iter()
+        .position(|column| column.name() == "word")
+        .unwrap();
 
     let mut selectors = vec![];
 
@@ -39,8 +40,8 @@ fn find_postings_list_parquet(
     // 1. The index is byte array index
     // 2. The index is sorted in ascending order
     for row_group in 0..offset_indexes.len() {
-        let offset_index = &offset_indexes[row_group][0];
-        let page_index = &page_indexes[row_group][0];
+        let offset_index = &offset_indexes[row_group][word_column_index];
+        let page_index = &page_indexes[row_group][word_column_index];
         let row_group_end = builder.metadata().row_group(row_group).num_rows();
 
         match page_index {
@@ -108,14 +109,9 @@ fn find_postings_list_parquet(
     if let Some(batch) = reader.next() {
         let batch = batch?;
         if batch.num_rows() > 0 {
-            let offsets: &UInt64Array = batch["offset"].as_primitive();
-            let lengths: &UInt64Array = batch["length"].as_primitive();
-
-            let offset = offsets.value(0);
-            let length = lengths.value(0);
-
-            postings_lists_file.seek(SeekFrom::Start(offset))?;
-            let postings_list = RoaringBitmap::deserialize_from(postings_lists_file.take(length))?;
+            let postings_lists: &BinaryArray = batch["postings_list"].as_binary();
+            let postings_list_bytes = postings_lists.value(0);
+            let postings_list = RoaringBitmap::deserialize_from(postings_list_bytes)?;
 
             Ok(postings_list)
         } else {
@@ -215,9 +211,6 @@ where
 }
 
 fn main() -> anyhow::Result<()> {
-    // Read postings lists and index from disk.
-    let postings_lists_file = File::open("postings_lists.bin")?;
-
     // REPL for querying the postings lists.
     println!("Enter a query:");
     let stdin = std::io::stdin().lock();
@@ -232,11 +225,8 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
-        let (eval_query_time, postings_lists) = measure_time(|| {
-            eval_query(&query, &|word| {
-                find_postings_list_parquet(word, &postings_lists_file)
-            })
-        });
+        let (eval_query_time, postings_lists) =
+            measure_time(|| eval_query(&query, &find_postings_list_parquet));
         let postings_lists = postings_lists?;
 
         eprintln!("Evaluated query in {:.8} ms", eval_query_time * 1000.0);
