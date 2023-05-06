@@ -13,3 +13,4 @@ serde = { version = "1.0.160", features = ["derive"] }
 anubistats-query = { path = "../anubistats-query" }
 arrow = "38.0.0"
 parquet = "38.0.0"
+time = { version = "0.3.21", features = ["formatting", "macros"] }

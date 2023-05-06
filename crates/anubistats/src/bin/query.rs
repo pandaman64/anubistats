@@ -1,9 +1,21 @@
 //! This binary provides a REPL for querying the index created by crates/anubistats/src/bin/index.rs.
 
-use std::{fs::File, io::BufRead};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    fs::File,
+    io::BufRead,
+    sync::Arc,
+};
 
 use anubistats_query::Query;
-use arrow::array::{AsArray, BinaryArray, BooleanArray, StringArray, UInt32Array, UInt64Array};
+use arrow::{
+    array::{
+        Array, ArrayBuilder, AsArray, BinaryArray, BooleanArray, StringArray, StringBuilder,
+        UInt32Array, UInt64Array, UInt64Builder,
+    },
+    datatypes::DataType,
+    row::{RowConverter, SortField},
+};
 use parquet::{
     arrow::{
         arrow_reader::{
@@ -198,6 +210,85 @@ fn retrieve_stored_fields(roaring_ids_filter: RoaringBitmap) -> anyhow::Result<V
     Ok(documents)
 }
 
+struct ScoresGroupedByDate {
+    date: StringArray,
+    score: UInt64Array,
+    count: UInt64Array,
+}
+
+fn group_scores_by_date(roaring_ids_filter: RoaringBitmap) -> anyhow::Result<ScoresGroupedByDate> {
+    let file = File::open("stored_fields.parquet")?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+
+    // Construct a reader that only reads the rows that have matching roaring IDs.
+    let predicate = ArrowPredicateFn::new(
+        ProjectionMask::leaves(
+            builder.parquet_schema(),
+            std::iter::once(
+                builder
+                    .parquet_schema()
+                    .columns()
+                    .iter()
+                    .position(|c| c.name() == "id")
+                    .unwrap(),
+            ),
+        ),
+        move |batch| {
+            let roaring_ids: &UInt32Array = batch.column(0).as_primitive();
+            Ok(BooleanArray::from_unary(roaring_ids, |roaring_id| {
+                roaring_ids_filter.contains(roaring_id)
+            }))
+        },
+    );
+    let row_filter = RowFilter::new(vec![Box::new(predicate)]);
+    let reader = builder.with_row_filter(row_filter).build()?;
+
+    let mut row_converter = RowConverter::new(vec![SortField::new(DataType::Utf8)])?;
+    let mut row_to_index = HashMap::new();
+    let mut date_builder = StringBuilder::new();
+    let mut sum_scores_builder = UInt64Builder::new();
+    let mut count_builder = UInt64Builder::new();
+
+    for batch in reader {
+        let batch = batch?;
+
+        let dates = &batch["date"];
+        let scores: &UInt64Array = batch["score"].as_primitive();
+
+        let keys = row_converter.convert_columns(&[Arc::clone(dates)])?;
+        for (i, key) in keys.iter().enumerate() {
+            let score = if !scores.is_null(i) {
+                scores.value(i)
+            } else {
+                0
+            };
+
+            match row_to_index.entry(key.owned()) {
+                Entry::Occupied(entry) => {
+                    let index = *entry.get();
+                    sum_scores_builder.values_slice_mut()[index] += score;
+                    count_builder.values_slice_mut()[index] += 1;
+                }
+                Entry::Vacant(entry) => {
+                    let index = sum_scores_builder.len();
+                    entry.insert(index);
+                    sum_scores_builder.append_value(score);
+                    count_builder.append_value(1);
+
+                    let dates: &StringArray = dates.as_string();
+                    date_builder.append_value(dates.value(i));
+                }
+            }
+        }
+    }
+
+    Ok(ScoresGroupedByDate {
+        date: date_builder.finish(),
+        score: sum_scores_builder.finish(),
+        count: count_builder.finish(),
+    })
+}
+
 fn measure_time<F, R>(f: F) -> (f64, R)
 where
     F: FnOnce() -> R,
@@ -237,11 +328,23 @@ fn main() -> anyhow::Result<()> {
             query
         );
 
-        let documents = retrieve_stored_fields(postings_lists)?;
-        for document in documents.iter().take(10) {
+        let documents = retrieve_stored_fields(postings_lists.clone())?;
+        for document in documents.iter().take(5) {
             println!(
                 "[{}] {}: {}",
                 document.roaring_id, document.doc_id, document.title
+            );
+        }
+
+        println!("How many scores the matched documents have on each date?");
+
+        let group_by_result = group_scores_by_date(postings_lists)?;
+        for i in 0..5 {
+            println!(
+                "{}: {} ({} documents)",
+                group_by_result.date.value(i),
+                group_by_result.score.value(i),
+                group_by_result.count.value(i)
             );
         }
     }
